@@ -14,29 +14,49 @@ namespace EFCache.Redis
         //Note- modifying these objects will alter locking scheme
         private readonly object _lock = new object();//used to put instance level lock; only one thread will execute code block per instance
 
-        private IDatabase _database;//lock don't work on this because it is being reassigned each time new connection requested; though _redis.GetDatabase() is thread safe and should be used to let mutiplexor manage connection for best performance. Considering these let's avoid putting lock on it
-        private readonly ConnectionMultiplexer _redis;
+        // private IDatabase _database;//lock don't work on this because it is being reassigned each time new connection requested; though _redis.GetDatabase() is thread safe and should be used to let mutiplexor manage connection for best performance. Considering these let's avoid putting lock on it
+        // private readonly ConnectionMultiplexer _redis;
         private readonly string _cacheIdentifier;
         public event EventHandler<RedisCacheException> CachingFailed;
+
+        private static ConfigurationOptions _configurationOptions;
+
+        private static IDatabase Cache
+        {
+            get
+            {
+                return Connection.GetDatabase();
+            }
+        }
+
+        private static readonly Lazy<ConnectionMultiplexer> LazyConnection
+          = new Lazy<ConnectionMultiplexer>(() => ConnectionMultiplexer.Connect(_configurationOptions));
+
+        public static ConnectionMultiplexer Connection
+        {
+            get
+            {
+                return LazyConnection.Value;
+            }
+        }
 
         public RedisCache(string config) : this(ConfigurationOptions.Parse(config)) {   }
 
         // ReSharper disable once MemberCanBePrivate.Global
+
         public RedisCache(ConfigurationOptions options)
         {
-            _redis = ConnectionMultiplexer.Connect(options);
-            _cacheIdentifier = "__EFCache.Redis_EntitySetKey_"; 
+            if (options == null) throw new ArgumentNullException("options");
+            _configurationOptions = options;
         }
-        
-        public RedisCache(string config, string cacheIdentifier)
-        {
-            _redis = ConnectionMultiplexer.Connect(ConfigurationOptions.Parse(config));
-            _cacheIdentifier = cacheIdentifier;
-        }
-        
+
+        public RedisCache(string config, string cacheIdentifier) : this(ConfigurationOptions.Parse(config), cacheIdentifier) { }
+      
         public RedisCache(ConfigurationOptions options, string cacheIdentifier)
         {
-            _redis = ConnectionMultiplexer.Connect(options);
+            if (options == null) throw new ArgumentNullException("options");
+            _configurationOptions = options;
+
             _cacheIdentifier = cacheIdentifier;
         }
 
@@ -55,14 +75,14 @@ namespace EFCache.Redis
         public bool GetItem(string key, out object value)
         {
             key.GuardAgainstNullOrEmpty(nameof(key));
-            _database = _redis.GetDatabase();//connect only if arguments are valid to optimize resources 
+            //_database = _redis.GetDatabase();//connect only if arguments are valid to optimize resources 
 
             key = HashKey(key);
             var now = DateTimeOffset.Now;//local variables are thread safe should be out of sync lock
             
             try
             {
-                value = _database.Get<CacheEntry>(key);
+                value = Cache.Get<CacheEntry>(key);
             } 
             catch (Exception e) 
             {
@@ -88,7 +108,7 @@ namespace EFCache.Redis
                 {
                     try
                     {
-                        _database.Set(key, entry);
+                        Cache.Set(key, entry);
                     }
                     catch (Exception e)
                     {
@@ -110,7 +130,7 @@ namespace EFCache.Redis
             // ReSharper disable once PossibleMultipleEnumeration - the guard clause should not enumerate, its just checking the reference is not null
             dependentEntitySets.GuardAgainstNull(nameof(dependentEntitySets));
            
-            _database = _redis.GetDatabase();
+            //_database = _redis.GetDatabase();
             
             key = HashKey(key);
             // ReSharper disable once PossibleMultipleEnumeration - the guard clause should not enumerate, its just checking the reference is not null
@@ -122,10 +142,10 @@ namespace EFCache.Redis
                 {
                     foreach (var entitySet in entitySets)
                     {
-                        _database.SetAdd(AddCacheQualifier(entitySet), key, CommandFlags.FireAndForget);
+                        Cache.SetAdd(AddCacheQualifier(entitySet), key, CommandFlags.FireAndForget);
                     }
 
-                    _database.Set(key, new CacheEntry(value, entitySets, slidingExpiration, absoluteExpiration));
+                    Cache.Set(key, new CacheEntry(value, entitySets, slidingExpiration, absoluteExpiration));
                 } 
                 catch (Exception e) 
                 {
@@ -152,7 +172,7 @@ namespace EFCache.Redis
             // ReSharper disable once PossibleMultipleEnumeration - the guard clause should not enumerate, its just checking the reference is not null
             entitySets.GuardAgainstNull(nameof(entitySets));
             
-            _database = _redis.GetDatabase();
+            //_database = _redis.GetDatabase();
             
             var itemsToInvalidate = new HashSet<string>();
 
@@ -163,9 +183,9 @@ namespace EFCache.Redis
                     // ReSharper disable once PossibleMultipleEnumeration - the guard clause should not enumerate, its just checking the reference is not null
                     foreach (var entitySet in entitySets) {
                         var entitySetKey = AddCacheQualifier(entitySet);
-                        var keys = _database.SetMembers(entitySetKey).Select(v => v.ToString());
+                        var keys = Cache.SetMembers(entitySetKey).Select(v => v.ToString());
                         itemsToInvalidate.UnionWith(keys);
-                        _database.KeyDelete(entitySetKey, CommandFlags.FireAndForget);
+                        Cache.KeyDelete(entitySetKey, CommandFlags.FireAndForget);
                     }
                 } 
                 catch (Exception e) 
@@ -185,7 +205,7 @@ namespace EFCache.Redis
         {
             key.GuardAgainstNullOrEmpty(nameof(key));
             
-            _database = _redis.GetDatabase();
+            //_database = _redis.GetDatabase();
 
             key = HashKey(key);
 
@@ -193,14 +213,14 @@ namespace EFCache.Redis
             {
                 try 
                 {
-                    var entry = _database.Get<CacheEntry>(key);
+                    var entry = Cache.Get<CacheEntry>(key);
 
                     if (entry == null) return;
 
-                    _database.KeyDelete(key, CommandFlags.FireAndForget);
+                    Cache.KeyDelete(key, CommandFlags.FireAndForget);
 
                     foreach (var set in entry.EntitySets) {
-                        _database.SetRemove(AddCacheQualifier(set), key, CommandFlags.FireAndForget);
+                        Cache.SetRemove(AddCacheQualifier(set), key, CommandFlags.FireAndForget);
                     }
                 } 
                 catch (Exception e) 
@@ -214,26 +234,31 @@ namespace EFCache.Redis
         {
             get
             {
-                _database = _redis.GetDatabase();
+                //_database = _redis.GetDatabase();
                 lock (_lock)
                 {
-                    var count = _database.Multiplexer.GetEndPoints()
-                        .Sum(endpoint => _database.Multiplexer.GetServer(endpoint).Keys(pattern: "*").LongCount());
+                    var count = Cache.Multiplexer.GetEndPoints()
+                        .Sum(endpoint => Cache.Multiplexer.GetServer(endpoint).Keys(pattern: "*").LongCount());
                     return count;
                 }
             }
         }
         public void Purge()
         {
-            _database = _redis.GetDatabase();
+            //_database = _redis.GetDatabase();
             lock (_lock)
             {
-                foreach (var endPoint in _database.Multiplexer.GetEndPoints())
+                foreach (var endPoint in Cache.Multiplexer.GetEndPoints())
                 {
-                    _database.Multiplexer.GetServer(endPoint).FlushDatabase();
+                    Cache.Multiplexer.GetServer(endPoint).FlushDatabase();
                 }
             }
 
+        }
+
+        public void Dispose()
+        {
+            Connection.Dispose();
         }
     }
 }
